@@ -17,11 +17,8 @@ A Python simulation that compares **Q-Learning-based routing** against **Dijkstr
 ## How to Run
 
 ### 1. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
+    All dependencies are in requirement.txt
+    
 ### 2. Run the simulation
 
 ```bash

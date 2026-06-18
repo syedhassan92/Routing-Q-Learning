@@ -2,11 +2,12 @@
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import simpledialog, messagebox
-import threading, queue, math
+import threading, queue, math, time, types
 import networkx as nx
 import numpy as np
 from q_learning_agent import QLearningAgent, compute_reward, extract_path
 from dijkstra_routing import format_path
+from visualizations import DijkstraVisualizer, QLearningRolloutVisualizer, PacketAnimator, CostComputationVisualizer, ComparisonVisualizer
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -28,7 +29,59 @@ class App(ctk.CTk):
         self.estart=None; self.drag=None; self.agent=None
         self.mq=queue.Queue(); self.busy=False
         self.dp=self.dc=self.qp=self.qc=None; self.cong=set()
+        # Timing - pre-congestion
+        self.dijk_time=0; self.ql_time=0
+        # Timing - post-congestion (after applying congestion)
+        self.dijk_time_post=0; self.ql_time_post=0
+        self.congestion_applied=False; self.reuse_ql_var=None
+        # Visualization state
+        self.dijk_viz=None; self.ql_animator=None; self.packet_animators=[]
+        self.dijk_steps=[]; self.dijk_step_idx=0; self.dijk_animating=False
+        self.ql_viz=None; self.ql_steps=[]; self.ql_step_idx=0; self.ql_animating=False
+        self.ql_train_steps=[]; self.ql_train_delay_ms=150
+        self.animating_packets=set(); self.cost_viz=None
+        self.comparison_viz=ComparisonVisualizer()
         self._ui()
+
+    def _q_delay(self, total_episodes: int) -> int:
+        # Keep the full replay within a reasonable time window.
+        # Small episode counts replay slower; large counts replay faster.
+        if total_episodes <= 0:
+            return 150
+        delay = int(45000 / total_episodes)
+        return max(60, min(400, delay))
+
+    def _fmt_q_table(self, q_table: np.ndarray, max_states: int = 12, precision: int = 2) -> str:
+        q = np.asarray(q_table)
+        if q.ndim != 2 or q.shape[0] != q.shape[1]:
+            return "(invalid Q-table)"
+        n = int(q.shape[0])
+
+        if n <= max_states:
+            cell_w = max(6, precision + 4)
+            head = " " * 5 + " ".join(f"{j:>{cell_w}d}" for j in range(n))
+            lines = [head, " " * 5 + "-" * (len(head) - 5)]
+            for i in range(n):
+                row = " ".join(f"{float(q[i, j]):>{cell_w}.{precision}f}" for j in range(n))
+                lines.append(f"{i:>3} | {row}")
+            return "\n".join(lines)
+
+        # For larger graphs, show top non-zero entries.
+        entries = []
+        for i in range(n):
+            for j in range(n):
+                v = float(q[i, j])
+                if abs(v) > 1e-6:
+                    entries.append((abs(v), i, j, v))
+        entries.sort(reverse=True)
+        top_n = 40
+        lines = [f"Q-table too large to print ({n}x{n}). Showing top {min(top_n, len(entries))} non-zero entries:"]
+        if not entries:
+            lines.append("(all zeros so far)")
+            return "\n".join(lines)
+        for k, (_, i, j, v) in enumerate(entries[:top_n], 1):
+            lines.append(f"{k:>2}. Q[{i},{j}] = {v:.{precision}f}")
+        return "\n".join(lines)
 
     def _ui(self):
         # Header
@@ -66,13 +119,16 @@ class App(ctk.CTk):
                                   fg_color="#1e2036",segmented_button_fg_color="#2d2f4e",
                                   segmented_button_selected_color="#7c3aed")
         self.tabs.pack(fill="x")
-        self.tabs.add("Log"); self.tabs.add("Comparison")
+        self.tabs.add("Log"); self.tabs.add("Comparison"); self.tabs.add("Visualization")
         self.log=ctk.CTkTextbox(self.tabs.tab("Log"),font=("Consolas",11),
                                 fg_color="#141524",text_color="#e2e8f0",corner_radius=8)
         self.log.pack(fill="both",expand=True,padx=4,pady=4)
         self.cmp=ctk.CTkTextbox(self.tabs.tab("Comparison"),font=("Consolas",11),
                                 fg_color="#141524",text_color="#e2e8f0",corner_radius=8)
         self.cmp.pack(fill="both",expand=True,padx=4,pady=4)
+        self.viz=ctk.CTkTextbox(self.tabs.tab("Visualization"),font=("Consolas",10),
+                                fg_color="#141524",text_color="#e2e8f0",corner_radius=8)
+        self.viz.pack(fill="both",expand=True,padx=4,pady=4)
 
     def _sidebar(self,sb):
         # Mode
@@ -88,6 +144,13 @@ class App(ctk.CTk):
                       command=self.run_dijk,font=("Segoe UI",12,"bold"),height=36).pack(fill="x",pady=3)
         ctk.CTkButton(sb,text="Train Q-Learning",fg_color="#059669",hover_color="#047857",
                       command=self.run_ql,font=("Segoe UI",12,"bold"),height=36).pack(fill="x",pady=3)
+        # Animation buttons
+        ctk.CTkButton(sb,text="🎬 Animate Dijkstra",fg_color="#7c3aed",hover_color="#6d28d9",
+                      command=self.anim_dijk,font=("Segoe UI",11,"bold"),height=32).pack(fill="x",pady=3)
+        ctk.CTkButton(sb,text="🎬 Animate Q-Learning",fg_color="#ef4444",hover_color="#dc2626",
+                  command=self.anim_ql,font=("Segoe UI",11,"bold"),height=32).pack(fill="x",pady=3)
+        ctk.CTkButton(sb,text="📦 Animate Packets",fg_color="#f59e0b",hover_color="#d97706",
+                      command=self.anim_packets,font=("Segoe UI",11,"bold"),height=32).pack(fill="x",pady=3)
         ef=ctk.CTkFrame(sb,fg_color="transparent")
         ef.pack(fill="x",pady=2)
         ctk.CTkLabel(ef,text="Episodes:",font=("Segoe UI",10),text_color="#94a3b8").pack(side="left")
@@ -119,6 +182,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(wf,text="New Weight:",font=("Segoe UI",10),text_color="#94a3b8").pack(side="left")
         self.wv=ctk.StringVar(value="20")
         ctk.CTkEntry(wf,textvariable=self.wv,width=60,height=28,corner_radius=6).pack(side="right")
+        self.reuse_ql_var=ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(sb,text="♻️ Reuse Q-Learning",variable=self.reuse_ql_var,
+                       font=("Segoe UI",10),text_color="#e2e8f0").pack(anchor="w",pady=2)
         ctk.CTkButton(sb,text="Apply Congestion",fg_color="#ea580c",hover_color="#c2410c",
                       command=self.do_cong,height=32,font=("Segoe UI",11,"bold")).pack(fill="x",pady=(4,8))
 
@@ -169,7 +235,25 @@ class App(ctk.CTk):
 
     def _dn(self,i,x,y):
         c=self.cv; s=i==self.source; t=i==self.target; sel=i==self.estart
-        fl=PAL["src"] if s else PAL["tgt"] if t else PAL["sel"] if sel else PAL["node"]
+        # Visualization colors for Dijkstra animation
+        explored = bool(self.dijk_viz and i in self.dijk_viz.explored)
+        frontier = bool(self.dijk_viz and i in self.dijk_viz.frontier)
+        ql_current = bool(self.ql_viz and self.ql_viz.current is not None and i == self.ql_viz.current)
+        ql_next = bool(self.ql_viz and self.ql_viz.next_node is not None and i == self.ql_viz.next_node)
+        ql_visited = bool(self.ql_viz and i in self.ql_viz.visited)
+
+        if explored:
+            fl = "#22c55e"
+        elif frontier:
+            fl = "#eab308"
+        elif ql_current:
+            fl = PAL["ql"]
+        elif ql_next:
+            fl = "#eab308"
+        elif ql_visited:
+            fl = PAL["wt"]
+        else:
+            fl = PAL["src"] if s else PAL["tgt"] if t else PAL["sel"] if sel else PAL["node"]
         bd=PAL["src_b"] if s else PAL["tgt_b"] if t else "#7c3aed" if sel else PAL["node_b"]
         for dr,gc in [(14,PAL["glow1"]),(10,PAL["glow2"]),(6,fl)]:
             r=R+dr; c.create_oval(x-r,y-r,x+r,y+r,fill="",outline=gc,width=2)
@@ -275,36 +359,88 @@ class App(ctk.CTk):
     def run_dijk(self):
         if not self._ok(): return
         G=self._G()
+        t_start=time.time()
         try:
             p=nx.dijkstra_path(G,self.source,self.target,weight="weight")
             c=int(nx.dijkstra_path_length(G,self.source,self.target,weight="weight"))
         except nx.NetworkXNoPath:
             self._msg("[!] No path exists!"); return
-        self.dp,self.dc=p,c; self._msg(f"[Dijkstra] {format_path(p)}, Cost: {c}")
-        self._table(); self._draw()
+        elapsed=time.time()-t_start
+        if self.congestion_applied:
+            self.dijk_time_post=elapsed
+            self._msg(f"[Dijkstra-Recompute] {format_path(p)}, Cost: {c}, Time: {elapsed*1000:.2f}ms")
+        else:
+            self.dijk_time=elapsed
+            self._msg(f"[Dijkstra] {format_path(p)}, Cost: {c}, Time: {elapsed*1000:.2f}ms")
+        self.dp,self.dc=p,c
+        # Populate Visualization tab
+        self.viz.delete("1.0","end")
+        self.viz.insert("end","DIJKSTRA ALGORITHM EXECUTION\n")
+        self.viz.insert("end","="*50+"\n\n")
+        self.viz.insert("end",f"Source: {self.source}\n")
+        self.viz.insert("end",f"Destination: {self.target}\n\n")
+        self.viz.insert("end",f"Path Found: {' → '.join(map(str, p))}\n")
+        self.viz.insert("end",f"Path Cost: {c}\n")
+        self.viz.insert("end",f"Hops: {len(p)-1}\n")
+        self.viz.insert("end",f"Execution Time: {elapsed*1000:.3f}ms\n\n")
+        self.viz.insert("end","Path Breakdown:\n")
+        self.viz.insert("end","-"*50+"\n")
+        for i in range(len(p)-1):
+            u,v=p[i],p[i+1]
+            w=G[u][v]['weight']
+            self.viz.insert("end",f"{u} → {v}: weight={w}\n")
+        self.tabs.set("Visualization")
+        self._draw()
 
     def run_ql(self):
         if not self._ok(): return
         try: eps=int(self.ep_var.get())
         except: messagebox.showerror("","Episodes must be a number."); return
-        self.busy=True; self.prog.set(0); self.stv.set("  Training Q-Learning ...")
-        self.agent=QLearningAgent(self.nid,self.nid); G=self._G()
-        s,t=self.source,self.target
+        self.busy=True; self.prog.set(0)
+        self.ql_train_steps=[]
+        # Decide if reusing or restarting
+        reuse=self.congestion_applied and self.reuse_ql_var.get() and self.agent is not None
+        if reuse:
+            self.stv.set("  Adapting Q-Learning (reusing knowledge)...")
+        else:
+            self.stv.set("  Training Q-Learning ...")
+            self.agent=QLearningAgent(self.nid,self.nid)
+        G=self._G(); s,t=self.source,self.target
         def work():
+            t_start=time.time()
             a=self.agent
-            for ep in range(1,eps+1):
+            eps_val=int(self.ep_var.get())
+            train_steps=[]
+            for ep in range(1,eps_val+1):
                 st,vis,tot=s,{s},0.0
+                last_up=None
                 for _ in range(50):
                     nb=list(G.neighbors(st))
                     if not nb: break
                     act=a.choose_action(st,nb)
                     rw=compute_reward(G,st,act,t,vis)
-                    a.update(st,act,rw,act); tot+=rw; vis.add(act); st=act
+                    old_q=float(a.q_table[st,act])
+                    a.update(st,act,rw,act)
+                    new_q=float(a.q_table[st,act])
+                    last_up=(st,act,float(rw),old_q,new_q)
+                    tot+=rw; vis.add(act); st=act
                     if st==t: break
                 a.epsilon=max(0.05,a.epsilon*0.995)
-                if ep%100==0: self.mq.put(("p",ep/eps))
+                if ep%100==0: self.mq.put(("p",ep/eps_val))
                 if ep%200==0: self.mq.put(("l",f"  Ep {ep}: Reward={tot:.1f}"))
-            p2,c2=extract_path(a,s,t,G); self.mq.put(("d",(p2,c2)))
+
+                # Snapshot for episode-by-episode animation
+                train_steps.append({
+                    "episode": ep,
+                    "episodes": eps_val,
+                    "reward": float(tot),
+                    "epsilon": float(a.epsilon),
+                    "visited": vis.copy(),
+                    "last_update": last_up,
+                    "q_table": a.q_table.astype(np.float32, copy=True),
+                })
+
+            p2,c2=extract_path(a,s,t,G); elapsed=time.time()-t_start; self.mq.put(("d",(p2,c2,elapsed,reuse,train_steps)))
         threading.Thread(target=work,daemon=True).start(); self._poll()
 
     def _poll(self):
@@ -313,11 +449,244 @@ class App(ctk.CTk):
             if k=="l": self._msg(d)
             elif k=="p": self.prog.set(d)
             elif k=="d":
-                self.qp,self.qc=d; self.prog.set(1)
-                self._msg(f"[Q-Learning] {format_path(self.qp)}, Cost: {self.qc}")
-                self.busy=False; self.stv.set("  Training complete!")
-                self._table(); self._draw(); return
+                self.qp,self.qc,elapsed,reused,train_steps=d; self.prog.set(1)
+                self.ql_train_steps=train_steps or []
+                if self.ql_train_steps:
+                    total_eps=int(self.ql_train_steps[-1].get("episodes", len(self.ql_train_steps)))
+                    self.ql_train_delay_ms=self._q_delay(total_eps)
+                if self.congestion_applied:
+                    self.ql_time_post=elapsed
+                    mode="(reused knowledge)" if reused else "(fresh training)"
+                    self._msg(f"[Q-Learning-Adapt] {format_path(self.qp)}, Cost: {self.qc}, Time: {elapsed:.2f}s {mode}")
+                else:
+                    self.ql_time=elapsed
+                    self._msg(f"[Q-Learning] {format_path(self.qp)}, Cost: {self.qc}, Time: {elapsed:.2f}s")
+                self.busy=False; self.stv.set("  Complete!")
+                # Populate Visualization tab
+                self.viz.delete("1.0","end")
+                self.viz.insert("end","Q-LEARNING TRAINING EXECUTION\n")
+                self.viz.insert("end","="*50+"\n\n")
+                self.viz.insert("end",f"Source: {self.source}\n")
+                self.viz.insert("end",f"Destination: {self.target}\n\n")
+                eps_count=int(self.ep_var.get())
+                mode_str="Adapting (reusing Q-table)" if reused else "Training (fresh start)"
+                self.viz.insert("end",f"Mode: {mode_str}\n")
+                self.viz.insert("end",f"Episodes: {eps_count}\n")
+                self.viz.insert("end",f"Training Time: {elapsed:.3f}s\n\n")
+                self.viz.insert("end",f"Path Found: {' → '.join(map(str, self.qp))}\n")
+                self.viz.insert("end",f"Path Cost: {self.qc}\n")
+                self.viz.insert("end",f"Hops: {len(self.qp)-1}\n\n")
+                G=self._G()
+                self.viz.insert("end","Path Breakdown:\n")
+                self.viz.insert("end","-"*50+"\n")
+                for i in range(len(self.qp)-1):
+                    u,v=self.qp[i],self.qp[i+1]
+                    if G.has_edge(u,v):
+                        w=G[u][v]['weight']
+                        self.viz.insert("end",f"{u} → {v}: weight={w}\n")
+                # Now populate Comparison tab (both algorithms have run)
+                self._table()
+                self.tabs.set("Visualization")
+                self._draw(); return
         if self.busy: self.after(80,self._poll)
+
+    def anim_dijk(self):
+        if not self._ok(): return
+        if self.busy:
+            messagebox.showinfo("","Wait for the current run to finish first."); return
+        if not self.dp:
+            messagebox.showwarning("","Run Dijkstra first to see path."); return
+        # Stop Q-Learning animation if it's running
+        self.ql_animating=False; self.ql_viz=None
+        self.dijk_viz=DijkstraVisualizer(self.cv,self.nodes,self.edges,self._G(),self.source,self.target)
+        self._msg("[Animation] Starting Dijkstra visualization...")
+        self.dijk_steps=self.dijk_viz.run_step_by_step()
+        self.dijk_step_idx=0
+        self.dijk_animating=True
+        self._animate_dijk_step()
+
+    def _animate_dijk_step(self):
+        if not self.dijk_animating or self.dijk_step_idx >= len(self.dijk_steps):
+            self._msg("[Animation] Dijkstra animation complete!")
+            self.dijk_animating=False; self.dijk_viz=None
+            self._draw(); return
+        step=self.dijk_steps[self.dijk_step_idx]
+        # Update visual state so canvas highlighting matches this step
+        if self.dijk_viz:
+            self.dijk_viz.explored = step.get('explored', set())
+            self.dijk_viz.frontier = step.get('frontier', set())
+            self.dijk_viz.distances = step.get('distances', {})
+        node,dist=step['current'],step['distance']
+        self.viz.delete("1.0","end")
+        self.viz.insert("end",f"Step {self.dijk_step_idx+1}/{len(self.dijk_steps)}\n\n")
+        self.viz.insert("end",f"Current Node: {node}\n")
+        self.viz.insert("end",f"Distance: {dist:.1f}\n\n")
+        self.viz.insert("end",f"Explored: {sorted(step['explored'])}\n")
+        self.viz.insert("end",f"Frontier: {sorted(step['frontier'])}\n\n")
+        self.viz.insert("end","Distances:\n")
+        for n in sorted(step['distances'].keys()):
+            d=step['distances'][n]
+            fmt="∞" if d==float('inf') else f"{d:.1f}"
+            self.viz.insert("end",f"  Node {n}: {fmt}\n")
+        self.tabs.set("Visualization")
+        self.dijk_step_idx+=1; self._draw()
+        self.after(300,self._animate_dijk_step)
+
+    def anim_ql(self):
+        if self.ql_animating:
+            self._msg("[Animation] Q-Learning animation stopped.")
+            self.ql_animating=False; self.ql_viz=None
+            self._draw(); return
+        if not self._ok(): return
+        if self.busy:
+            messagebox.showinfo("","Wait for the current run to finish first."); return
+        if self.agent is None or not self.qp:
+            messagebox.showwarning("","Train Q-Learning first to see a path."); return
+        # Stop Dijkstra animation if it's running
+        self.dijk_animating=False; self.dijk_viz=None
+
+        # Prefer episode-by-episode Q-table replay if we have training history.
+        if self.ql_train_steps:
+            self._msg("[Animation] Replaying Q-table updates per episode...")
+            self.ql_steps=self.ql_train_steps
+            self.ql_step_idx=0
+            self.ql_animating=True
+            # Use a simple state container for canvas highlighting
+            self.ql_viz=types.SimpleNamespace(current=None,next_node=None,visited=set())
+            self._animate_ql_training_step()
+            return
+
+        # Fallback: greedy rollout animation (no Q-table updates per episode)
+        self.ql_viz=QLearningRolloutVisualizer(self.agent,self._G(),self.source,self.target)
+        self._msg("[Animation] Starting Q-Learning rollout visualization...")
+        self.ql_steps=self.ql_viz.run_step_by_step()
+        self.ql_step_idx=0
+        self.ql_animating=True
+        self._animate_ql_step()
+
+    def _animate_ql_training_step(self):
+        if not self.ql_animating or self.ql_step_idx >= len(self.ql_steps):
+            self._msg("[Animation] Q-Learning training replay complete!")
+            self.ql_animating=False; self.ql_viz=None
+            self._draw(); return
+
+        step=self.ql_steps[self.ql_step_idx]
+        ep=int(step.get("episode", self.ql_step_idx+1))
+        total_eps=int(step.get("episodes", len(self.ql_steps)))
+        rew=float(step.get("reward", 0.0))
+        eps=float(step.get("epsilon", 0.0))
+        last=step.get("last_update")
+        visited=step.get("visited", set())
+        qtab=step.get("q_table")
+
+        if self.ql_viz is not None and last is not None:
+            s,a,_,_,_=last
+            self.ql_viz.current=s
+            self.ql_viz.next_node=a
+            self.ql_viz.visited=visited
+
+        self.viz.delete("1.0","end")
+        self.viz.insert("end","Q-LEARNING Q-TABLE EVOLUTION (PER EPISODE)\n")
+        self.viz.insert("end","="*50+"\n\n")
+        self.viz.insert("end",f"Episode: {ep}/{total_eps}\n")
+        self.viz.insert("end",f"Total Reward (this episode): {rew:.1f}\n")
+        self.viz.insert("end",f"Epsilon: {eps:.3f}\n")
+        if last is not None:
+            s,a,rw,old_q,new_q=last
+            self.viz.insert("end",f"Last Update: Q[{s},{a}] {old_q:.3f} → {new_q:.3f} (r={rw:.1f})\n")
+        self.viz.insert("end","\nQ-table snapshot:\n")
+        self.viz.insert("end",self._fmt_q_table(qtab)+"\n")
+
+        self.tabs.set("Visualization")
+        self.ql_step_idx+=1; self._draw()
+        self.after(self.ql_train_delay_ms,self._animate_ql_training_step)
+
+    def _animate_ql_step(self):
+        if not self.ql_animating or self.ql_step_idx >= len(self.ql_steps):
+            self._msg("[Animation] Q-Learning animation complete!")
+            self.ql_animating=False; self.ql_viz=None
+            self._draw(); return
+
+        step=self.ql_steps[self.ql_step_idx]
+        # Update visual state so canvas highlighting matches this step
+        if self.ql_viz:
+            self.ql_viz.current = step.get('current')
+            self.ql_viz.next_node = step.get('chosen')
+            self.ql_viz.visited = step.get('visited', set())
+
+        cur = step.get('current')
+        chosen = step.get('chosen')
+        w = step.get('edge_weight')
+        cum = step.get('cumulative_cost')
+        eps = step.get('epsilon', 0.0)
+        path = step.get('path', [])
+
+        self.viz.delete("1.0","end")
+        self.viz.insert("end",f"Step {self.ql_step_idx+1}/{len(self.ql_steps)}\n\n")
+        self.viz.insert("end",f"Mode: Greedy rollout from Q-table\n")
+        self.viz.insert("end",f"Epsilon (training setting): {eps:.3f}\n\n")
+        self.viz.insert("end",f"Current Node: {cur}\n")
+        self.viz.insert("end",f"Chosen Next: {chosen}\n")
+        if w is not None:
+            self.viz.insert("end",f"Edge Weight: {w:.1f}\n")
+        self.viz.insert("end",f"Cumulative Cost: {cum:.1f}\n\n")
+
+        self.viz.insert("end",f"Path So Far: {' → '.join(map(str, path))}\n\n")
+
+        qvals = step.get('q_values', {})
+        if qvals:
+            self.viz.insert("end","Q-values for outgoing actions:\n")
+            for n,q in sorted(qvals.items(), key=lambda kv: kv[1], reverse=True):
+                mark = "  <-- chosen" if chosen == n else ""
+                self.viz.insert("end",f"  {cur} → {n}: Q={q:.3f}{mark}\n")
+
+        self.tabs.set("Visualization")
+        self.ql_step_idx+=1; self._draw()
+        self.after(300,self._animate_ql_step)
+
+    def anim_packets(self):
+        if not self.dp or not self.qp:
+            messagebox.showwarning("","Run both Dijkstra and Q-Learning first."); return
+        self._msg("[Packets] Starting packet routing animation...")
+        self.ql_animator=PacketAnimator(self.cv,self.nodes,self.edges)
+        p1=self.ql_animator.create_packet(self.dp,color=PAL["dijk"],speed=2.0)
+        p2=self.ql_animator.create_packet(self.qp,color=PAL["ql"],speed=2.0)
+        self.animating_packets={p1,p2}
+        self._animate_packets_loop()
+
+    def _animate_packets_loop(self):
+        if not self.animating_packets:
+            self._msg("[Packets] Animation complete!")
+            final_txt=f"Dijkstra: {self.dp} (Cost: {self.dc})\nQ-Learning: {self.qp} (Cost: {self.qc})"
+            self.viz.delete("1.0","end"); self.viz.insert("end",final_txt)
+            self.tabs.set("Visualization"); self._draw(); return
+        still_animating=[]
+        for pid in list(self.animating_packets):
+            if self.ql_animator.animate_packet(pid):
+                still_animating.append(pid)
+            else:
+                stats=self.ql_animator.get_packet_stats(pid)
+                self._msg(f"[Packets] Packet reached destination. Path: {stats['path']}, Cost: {stats['total_cost']:.1f}")
+        self.animating_packets=set(still_animating); self._draw_with_packets()
+        self.after(40,self._animate_packets_loop)
+
+    def _draw_with_packets(self):
+        c=self.cv; c.delete("all")
+        w,h=c.winfo_width(),c.winfo_height()
+        for x in range(0,w,50): c.create_line(x,0,x,h,fill=PAL["grid"])
+        for y in range(0,h,50): c.create_line(0,y,w,y,fill=PAL["grid"])
+        for (u,v),wt in self.edges.items(): self._de(u,v,wt,PAL["cong"] if (u,v) in self.cong else PAL["edge"])
+        if self.dp: self._dpath(self.dp,PAL["dijk"],-7)
+        if self.qp: self._dpath(self.qp,PAL["ql"],7)
+        # Draw packets
+        for pid in self.animating_packets:
+            pos=self.ql_animator.get_packet_position(pid)
+            if pos:
+                pkt=next((p for p in self.ql_animator.packets if p['id']==pid),None)
+                if pkt:
+                    c.create_oval(pos[0]-8,pos[1]-8,pos[0]+8,pos[1]+8,fill=pkt['color'],outline=pkt['color'])
+        for i,(x,y) in self.nodes.items(): self._dn(i,x,y)
+        self._legend()
 
     def do_cong(self):
         sel=self.ecb.get()
@@ -326,32 +695,84 @@ class App(ctk.CTk):
         except: messagebox.showerror("","Weight must be a number."); return
         p=sel.split(); u,v=int(p[0]),int(p[2])
         old=self.edges[(u,v)]; self.edges[(u,v)]=nw; self.cong.add((u,v))
-        self._msg(f"[Congestion] {u}->{v}: {old} -> {nw}"); self._combo(); self.clr_paths()
+        self.congestion_applied=True
+        self._msg(f"[Congestion] {u}->{v}: {old} -> {nw} (Run algorithms to recompute)"); self._combo(); self.clr_paths()
 
     def _table(self):
         if not self.dp or not self.qp: return
         self.cmp.delete("1.0","end")
-        self.cmp.insert("end","  COMPARISON TABLE\n")
-        self.cmp.insert("end","  "+"-"*46+"\n")
-        self.cmp.insert("end",f"  {'Strategy':<14} {'Path':<18} {'Cost':>5} {'Hops':>5}\n")
-        self.cmp.insert("end","  "+"-"*46+"\n")
-        self.cmp.insert("end",f"  {'Dijkstra':<14} {format_path(self.dp):<18} {self.dc:>5} {len(self.dp)-1:>5}\n")
-        self.cmp.insert("end",f"  {'Q-Learning':<14} {format_path(self.qp):<18} {self.qc:>5} {len(self.qp)-1:>5}\n")
-        self.cmp.insert("end","  "+"-"*46+"\n")
-        diff=self.qc-self.dc
-        if diff==0: self.cmp.insert("end","  Both found the SAME optimal path!\n")
-        elif diff>0: self.cmp.insert("end",f"  Dijkstra is cheaper by {diff}\n")
-        else: self.cmp.insert("end",f"  Q-Learning is cheaper by {-diff}\n")
+        if self.congestion_applied and self.dijk_time_post>0 and self.ql_time_post>0:
+            # Post-congestion comparison
+            self.cmp.insert("end","  CONGESTION IMPACT ANALYSIS\n")
+            self.cmp.insert("end","  "+"="*70+"\n\n")
+            self.cmp.insert("end","  BEFORE CONGESTION\n")
+            self.cmp.insert("end","  "+"-"*70+"\n")
+            self.cmp.insert("end",f"  {'Strategy':<14} {'Path':<18} {'Cost':>5} {'Time':>12}\n")
+            self.cmp.insert("end","  "+"-"*70+"\n")
+            dijk_time_pre=f"{self.dijk_time*1000:.2f}ms"
+            ql_time_pre=f"{self.ql_time:.2f}s" if self.ql_time>0.1 else f"{self.ql_time*1000:.0f}ms"
+            self.cmp.insert("end",f"  {'Dijkstra':<14} {format_path(self.dp):<18} {self.dc:>5} {dijk_time_pre:>12}\n")
+            self.cmp.insert("end",f"  {'Q-Learning':<14} {format_path(self.qp):<18} {self.qc:>5} {ql_time_pre:>12}\n\n")
+            
+            self.cmp.insert("end","  AFTER CONGESTION (RECOMPUTED)\n")
+            self.cmp.insert("end","  "+"-"*70+"\n")
+            self.cmp.insert("end",f"  {'Strategy':<14} {'Path':<18} {'Cost':>5} {'Time':>12}\n")
+            self.cmp.insert("end","  "+"-"*70+"\n")
+            dijk_time_post=f"{self.dijk_time_post*1000:.2f}ms"
+            ql_time_post=f"{self.ql_time_post:.2f}s" if self.ql_time_post>0.1 else f"{self.ql_time_post*1000:.0f}ms"
+            self.cmp.insert("end",f"  {'Dijkstra':<14} {format_path(self.dp):<18} {self.dc:>5} {dijk_time_post:>12}\n")
+            self.cmp.insert("end",f"  {'Q-Learning':<14} {format_path(self.qp):<18} {self.qc:>5} {ql_time_post:>12}\n\n")
+            
+            # Calculate changes
+            dijk_change=(self.dijk_time_post-self.dijk_time)/self.dijk_time*100 if self.dijk_time>0 else 0
+            ql_change=(self.ql_time_post-self.ql_time)/self.ql_time*100 if self.ql_time>0 else 0
+            
+            self.cmp.insert("end","  TIME CHANGE AFTER CONGESTION\n")
+            self.cmp.insert("end","  "+"-"*70+"\n")
+            self.cmp.insert("end",f"  Dijkstra: {dijk_change:+.1f}% (slower recomputation)\n")
+            ql_mode="(reusing Q-values)" if self.reuse_ql_var.get() else "(fresh training)"
+            self.cmp.insert("end",f"  Q-Learning: {ql_change:+.1f}% {ql_mode}\n")
+        else:
+            # Pre-congestion comparison
+            self.cmp.insert("end","  COMPARISON TABLE\n")
+            self.cmp.insert("end","  "+"-"*62+"\n")
+            self.cmp.insert("end",f"  {'Strategy':<14} {'Path':<18} {'Cost':>5} {'Hops':>5} {'Time':>12}\n")
+            self.cmp.insert("end","  "+"-"*62+"\n")
+            dijk_time_str=f"{self.dijk_time*1000:.2f}ms"
+            ql_time_str=f"{self.ql_time:.2f}s" if self.ql_time>0.1 else f"{self.ql_time*1000:.0f}ms"
+            self.cmp.insert("end",f"  {'Dijkstra':<14} {format_path(self.dp):<18} {self.dc:>5} {len(self.dp)-1:>5} {dijk_time_str:>12}\n")
+            self.cmp.insert("end",f"  {'Q-Learning':<14} {format_path(self.qp):<18} {self.qc:>5} {len(self.qp)-1:>5} {ql_time_str:>12}\n")
+            self.cmp.insert("end","  "+"-"*62+"\n")
+            diff=self.qc-self.dc
+            if diff==0: self.cmp.insert("end","  Both found the SAME optimal path!\n")
+            elif diff>0: self.cmp.insert("end",f"  Dijkstra is cheaper by {diff}\n")
+            else: self.cmp.insert("end",f"  Q-Learning is cheaper by {-diff}\n")
+            speedup=self.ql_time/self.dijk_time if self.dijk_time>0 else 0
+            self.cmp.insert("end",f"  Q-Learning is {speedup:.0f}x slower than Dijkstra\n")
         self.tabs.set("Comparison")
 
     def clr_paths(self):
-        self.dp=self.dc=self.qp=self.qc=None; self._draw()
+        self.dp=self.dc=self.qp=self.qc=None
+        if not self.congestion_applied:
+            self.dijk_time=0; self.ql_time=0
+        self.dijk_viz=None; self.dijk_animating=False
+        self.ql_viz=None; self.ql_animating=False
+        self.ql_train_steps=[]
+        self.animating_packets.clear(); self.ql_animator=None
+        self._draw()
 
     def clr_all(self):
         self.nodes.clear(); self.edges.clear(); self.cong.clear()
         self.nid=0; self.source=self.target=None
         self.dp=self.dc=self.qp=self.qc=None; self.agent=self.estart=None
-        self.log.delete("1.0","end"); self.cmp.delete("1.0","end")
+        self.dijk_time=0; self.ql_time=0
+        self.dijk_time_post=0; self.ql_time_post=0
+        self.congestion_applied=False
+        self.dijk_viz=None; self.dijk_animating=False
+        self.ql_viz=None; self.ql_animating=False
+        self.ql_train_steps=[]
+        self.animating_packets.clear(); self.ql_animator=None
+        self.log.delete("1.0","end"); self.cmp.delete("1.0","end"); self.viz.delete("1.0","end")
         self.prog.set(0); self._combo(); self._draw()
 
     def load_ex(self):

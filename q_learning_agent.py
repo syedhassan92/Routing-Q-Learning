@@ -1,10 +1,3 @@
-"""
-q_learning_agent.py
-====================
-A tabular Q-Learning agent that learns optimal routing paths in a weighted
-directed network graph.  The agent is trained from scratch -- no ML frameworks.
-"""
-
 from typing import List, Tuple
 
 import numpy as np
@@ -12,45 +5,7 @@ import networkx as nx
 
 
 class QLearningAgent:
-    """Tabular Q-Learning agent for network routing.
-
-    Attributes
-    ----------
-    n_states : int
-        Number of nodes (states) in the network.
-    q_table : np.ndarray
-        Q-value matrix of shape ``(n_states, n_states)``.
-    alpha : float
-        Learning rate.
-    gamma : float
-        Discount factor.
-    epsilon : float
-        Current exploration rate (decays over training).
-    """
-
-    def __init__(
-        self,
-        n_states: int,
-        n_actions: int,
-        alpha: float = 0.2,
-        gamma: float = 0.9,
-        epsilon: float = 0.3,
-    ) -> None:
-        """Initialise the Q-Learning agent.
-
-        Parameters
-        ----------
-        n_states : int
-            Total number of nodes in the graph.
-        n_actions : int
-            Same as *n_states* (action = next-node to move to).
-        alpha : float
-            Learning rate  (default 0.2).
-        gamma : float
-            Discount factor (default 0.9).
-        epsilon : float
-            Initial exploration rate (default 0.3).
-        """
+    def __init__(self,n_states: int,n_actions: int,alpha: float = 0.2,gamma: float = 0.9,epsilon: float = 0.3,) -> None:
         self.n_states = n_states
         self.n_actions = n_actions
         self.alpha = alpha
@@ -59,20 +14,6 @@ class QLearningAgent:
         self.q_table = np.zeros((n_states, n_states))
 
     def choose_action(self, state: int, valid_actions: List[int]) -> int:
-        """Select an action using an epsilon-greedy policy.
-
-        Parameters
-        ----------
-        state : int
-            Current node.
-        valid_actions : list[int]
-            Reachable neighbours the agent can move to.
-
-        Returns
-        -------
-        int
-            The chosen next node.
-        """
         if np.random.random() < self.epsilon:
             return int(np.random.choice(valid_actions))
         # Greedy: pick the valid action with the highest Q-value
@@ -81,21 +22,9 @@ class QLearningAgent:
         return valid_actions[best_idx]
 
     def update(self, state: int, action: int, reward: float, next_state: int) -> None:
-        """Apply the Q-learning update rule.
 
-        Q(s, a) <- Q(s, a) + alpha [ r + gamma * max_a' Q(s', a') - Q(s, a) ]
+        #Q(s, a) ← Q(s, a) + α[r + γ·max_a'(Q(s', a')) - Q(s, a)]
 
-        Parameters
-        ----------
-        state : int
-            State before the action.
-        action : int
-            Action taken (next node).
-        reward : float
-            Immediate reward received.
-        next_state : int
-            State after the action.
-        """
         best_next = np.max(self.q_table[next_state])
         td_target = reward + self.gamma * best_next
         td_error = td_target - self.q_table[state, action]
@@ -104,40 +33,7 @@ class QLearningAgent:
 
 # -- Reward helpers ------------------------------------------------------------
 
-def compute_reward(
-    G: nx.DiGraph,
-    current: int,
-    next_node: int,
-    target: int,
-    visited: set,
-) -> float:
-    """Calculate the immediate reward for moving from *current* to *next_node*.
-
-    Reward scheme
-    -------------
-    * **+100** for reaching the destination.
-    * **-weight** of the traversed link (penalises costly edges).
-    * **-1** step penalty  (encourages shorter paths).
-    * **-10** if *next_node* was already visited (loop penalty).
-
-    Parameters
-    ----------
-    G : nx.DiGraph
-        The network graph.
-    current : int
-        Current node.
-    next_node : int
-        Node the agent moves to.
-    target : int
-        Destination node.
-    visited : set
-        Set of already-visited nodes in the current episode.
-
-    Returns
-    -------
-    float
-        The computed reward.
-    """
+def compute_reward(G: nx.DiGraph,current: int,next_node: int,target: int,visited: set,) -> float:
     reward = 0.0
 
     # Goal bonus
@@ -160,45 +56,8 @@ def compute_reward(
 
 # -- Training loop -------------------------------------------------------------
 
-def train(
-    agent: QLearningAgent,
-    G: nx.DiGraph,
-    source: int,
-    target: int,
-    episodes: int = 1000,
-    max_steps: int = 50,
-    epsilon_decay: float = 0.995,
-    epsilon_min: float = 0.05,
-    verbose: bool = True,
-) -> List[float]:
-    """Train the Q-learning agent on the directed network.
-
-    Parameters
-    ----------
-    agent : QLearningAgent
-        The agent to train.
-    G : nx.DiGraph
-        Directed network graph.
-    source : int
-        Start node.
-    target : int
-        Destination node.
-    episodes : int
-        Number of training episodes (default 1000).
-    max_steps : int
-        Maximum steps per episode before truncation (default 50).
-    epsilon_decay : float
-        Multiplicative decay applied to epsilon each episode.
-    epsilon_min : float
-        Minimum value of epsilon.
-    verbose : bool
-        If *True*, print progress every 100 episodes.
-
-    Returns
-    -------
-    list[float]
-        Per-episode total rewards (learning curve).
-    """
+def train(agent: QLearningAgent,G: nx.DiGraph,source: int,target: int,episodes: int = 1000,max_steps: int = 50,epsilon_decay: float = 0.995,epsilon_min: float = 0.05,verbose: bool = True,) -> List[float]:
+   
     episode_rewards: List[float] = []
 
     for ep in range(1, episodes + 1):
@@ -237,33 +96,7 @@ def train(
 
 # -- Path extraction -----------------------------------------------------------
 
-def extract_path(
-    agent: QLearningAgent,
-    source: int,
-    target: int,
-    G: nx.DiGraph,
-    max_steps: int = 50,
-) -> Tuple[List[int], int]:
-    """Extract the greedy path from the trained Q-table.
-
-    Parameters
-    ----------
-    agent : QLearningAgent
-        A trained agent.
-    source : int
-        Start node.
-    target : int
-        Destination node.
-    G : nx.DiGraph
-        Directed network graph (used for neighbour lookup & edge weights).
-    max_steps : int
-        Safety limit to avoid infinite loops.
-
-    Returns
-    -------
-    tuple[list[int], int]
-        (path, cost) -- the greedy path and its total edge-weight cost.
-    """
+def extract_path(agent: QLearningAgent,source: int,target: int,G: nx.DiGraph,max_steps: int = 50,) -> Tuple[List[int], int]:
     path = [source]
     state = source
     cost = 0
@@ -285,19 +118,34 @@ def extract_path(
 
 
 if __name__ == "__main__":
-    from dijkstra_routing import format_path
+    from dijkstra_routing import dijkstra_path, format_path
     import networkx as nx
 
-    # Create a simple graph for testing since network_graph is missing
     G = nx.Graph()
+    # Path 1: 4 hops, total weight = 9.9 (Dijkstra's favourite because 9.9 < 10)
     G.add_edges_from([
-        (0, 1, {"weight": 10}), (1, 2, {"weight": 15}),
-        (2, 3, {"weight": 10}), (3, 4, {"weight": 20}),
-        (4, 5, {"weight": 10}), (2, 5, {"weight": 50})
+        (0, 1, {"weight": 2.0}), 
+        (1, 2, {"weight": 2.0}),
+        (2, 3, {"weight": 2.9}), 
+        (3, 4, {"weight": 3.0}),
+    ])
+    
+    # Path 2: 2 hops, total weight = 10.0 (Q-Learning's favourite because fewer step penalties)
+    G.add_edges_from([
+        (0, 5, {"weight": 5.0}), 
+        (5, 4, {"weight": 5.0})
     ])
 
+    print("--- Evaluating Paths from Node 0 to Node 4 ---")
+
+    # Dijkstra
+    d_path, d_cost = dijkstra_path(G, 0, 4)
+    print(f"\nDijkstra Path:   [{format_path(d_path)}], Cost (Weight): {d_cost:.1f}, Hops: {len(d_path)-1}")
+
+    # Q-Learning
     n = max(G.nodes) + 1
     agent = QLearningAgent(n, n)
-    rewards = train(agent, G, source=2, target=5, episodes=1000)
-    path, cost = extract_path(agent, 2, 5, G)
-    print(f"\nQ-Learning Path: [{format_path(path)}], Cost: {cost}")
+    rewards = train(agent, G, source=0, target=4, episodes=1000, verbose=False)
+    q_path, q_cost = extract_path(agent, 0, 4, G)
+    print(f"Q-Learning Path: [{format_path(q_path)}], Cost (Weight): {q_cost:.1f}, Hops: {len(q_path)-1}\n")
+

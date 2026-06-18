@@ -1,51 +1,15 @@
-"""
-dijkstra_routing.py
-====================
-Computes the shortest (lowest-cost) path between two nodes in a weighted
-graph using Dijkstra's algorithm via NetworkX.
-"""
-
 from typing import List, Tuple
 
 import networkx as nx
 
 
-def dijkstra_path(G: nx.Graph, source: int, target: int) -> Tuple[List[int], int]:
-    """Find the shortest path and its total cost using Dijkstra's algorithm.
-
-    Parameters
-    ----------
-    G : nx.Graph
-        Weighted undirected graph.
-    source : int
-        Source node (router).
-    target : int
-        Destination node (router).
-
-    Returns
-    -------
-    tuple[list[int], int]
-        (path, cost) where *path* is the ordered list of nodes and *cost*
-        is the sum of edge weights along that path.
-    """
+def dijkstra_path(G: nx.Graph, source: int, target: int):
     path = nx.dijkstra_path(G, source, target, weight="weight")
     cost = nx.dijkstra_path_length(G, source, target, weight="weight")
     return path, int(cost)
 
 
-def format_path(path: List[int]) -> str:
-    """Return a human-readable arrow-separated path string.
-
-    Parameters
-    ----------
-    path : list[int]
-        Ordered list of node IDs.
-
-    Returns
-    -------
-    str
-        e.g. ``'0→1→4→7'``
-    """
+def format_path(path: List[int]):
     return "->".join(str(n) for n in path)
 
 
